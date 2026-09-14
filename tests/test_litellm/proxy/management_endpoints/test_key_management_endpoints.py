@@ -6589,6 +6589,8 @@ async def test_generate_key_with_router_settings(monkeypatch):
     2. Serializing router_settings to JSON when saving to database
     3. Storing router_settings in the key record
     """
+    from types import SimpleNamespace
+
     mock_prisma_client = AsyncMock()
     mock_prisma_client.jsonify_object = lambda data: data
 
@@ -6615,6 +6617,9 @@ async def test_generate_key_with_router_settings(monkeypatch):
         return_value=[]
     )
     mock_prisma_client.db.litellm_verificationtoken.count = AsyncMock(return_value=0)
+    mock_prisma_client.db.litellm_proxymodeltable.find_many = AsyncMock(return_value=[
+        SimpleNamespace(model_id="weighted-id", model_name="gpt-4", model_info={})
+    ])
 
     monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
 
@@ -6630,6 +6635,7 @@ async def test_generate_key_with_router_settings(monkeypatch):
         "routing_strategy": "usage-based",
         "num_retries": 3,
         "model_group_retry_policy": {"gpt-4": {"RateLimitErrorRetries": 5}},
+        "weights": {"gpt-4": {"weighted-id": 1}},
     }
 
     request_data = GenerateKeyRequest(
@@ -6680,19 +6686,39 @@ async def test_generate_key_with_router_settings(monkeypatch):
     # Verify router_settings matches input (regardless of serialization state)
     assert actual_settings == router_settings_data
 
+    mock_prisma_client.insert_data.reset_mock()
+    with pytest.raises(ProxyException, match="Unknown deployment ID"):
+        await generate_key_fn(
+            data=GenerateKeyRequest(router_settings={"weights": {"gpt-4": {"unknown-id": 1}}}),
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.PROXY_ADMIN,
+                user_id="user-router-1",
+            ),
+        )
+    mock_prisma_client.insert_data.assert_not_awaited()
+
 
 @pytest.mark.asyncio
-async def test_update_key_with_router_settings(monkeypatch):
+@pytest.mark.parametrize("request_name", ["UpdateKeyRequest", "RegenerateKeyRequest"])
+async def test_update_key_with_router_settings(monkeypatch, request_name):
     """
     Test that /key/update correctly handles router_settings by:
     1. Accepting router_settings as a dict parameter
     2. Serializing router_settings to JSON when updating database
     3. Updating router_settings in the key record
     """
-    from litellm.proxy._types import LiteLLM_VerificationToken, UpdateKeyRequest
+    from types import SimpleNamespace
+    from litellm.proxy import _types
+    from litellm.proxy._types import LiteLLM_VerificationToken
     from litellm.proxy.management_endpoints.key_management_endpoints import (
         prepare_key_update_data,
     )
+    table = SimpleNamespace(find_many=AsyncMock(return_value=[
+        SimpleNamespace(model_id="weighted-id", model_name="gpt-4", model_info={})
+    ]))
+    db = SimpleNamespace(db=SimpleNamespace(litellm_proxymodeltable=table))
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", db)
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", None)
 
     # Mock existing key
     existing_key = LiteLLM_VerificationToken(
@@ -6710,9 +6736,11 @@ async def test_update_key_with_router_settings(monkeypatch):
     router_settings_data = {
         "routing_strategy": "latency-based",
         "num_retries": 2,
+        "weights": {"gpt-4": {"weighted-id": 1}},
     }
 
-    update_request = UpdateKeyRequest(
+    request_type = getattr(_types, request_name)
+    update_request = request_type(
         key="test-token-router", router_settings=router_settings_data
     )
 
@@ -6727,6 +6755,200 @@ async def test_update_key_with_router_settings(monkeypatch):
     # Verify router_settings can be deserialized and matches input
     deserialized_settings = json.loads(result["router_settings"])
     assert deserialized_settings == router_settings_data
+
+    with pytest.raises(HTTPException, match="Unknown deployment ID"):
+        await prepare_key_update_data(
+            data=request_type(key="test-token-router", router_settings={"weights": {"gpt-4": {"unknown-id": 1}}}),
+            existing_key_row=existing_key,
+        )
+
+
+@pytest.fixture
+def router_weight_key_scope(monkeypatch):
+    from types import SimpleNamespace
+
+    table = SimpleNamespace(find_many=AsyncMock(return_value=[
+        SimpleNamespace(
+            model_id="weighted-id",
+            model_name="gpt-4",
+            model_info={"team_id": "old-team"},
+        )
+    ]))
+    db = SimpleNamespace(db=SimpleNamespace(litellm_proxymodeltable=table))
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", db)
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", None)
+    existing_key = LiteLLM_VerificationToken(
+        token="test-token-router",
+        team_id="old-team",
+        router_settings={"weights": {"gpt-4": {"weighted-id": 1}}},
+        metadata={},
+    )
+    return existing_key, table
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_name", ["UpdateKeyRequest", "RegenerateKeyRequest"])
+@pytest.mark.parametrize("target_team", ["new-team", None], ids=["move", "detach"])
+async def test_key_team_change_revalidates_retained_weights(
+    router_weight_key_scope, request_name, target_team
+):
+    from litellm.proxy import _types
+
+    existing_key, table = router_weight_key_scope
+    request = getattr(_types, request_name)(
+        key=existing_key.token, team_id=target_team
+    )
+    with pytest.raises(HTTPException, match="does not belong to this team") as exc:
+        await prepare_key_update_data(request, existing_key)
+    assert exc.value.status_code == 400
+    table.find_many.assert_awaited_once_with(
+        where={"model_id": {"in": ["weighted-id"]}}
+    )
+    assert existing_key.team_id == "old-team"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_name", ["UpdateKeyRequest", "RegenerateKeyRequest"])
+@pytest.mark.parametrize("target_team", ["new-team", None], ids=["move", "detach"])
+async def test_key_team_change_retains_valid_global_weights(
+    router_weight_key_scope, request_name, target_team
+):
+    from litellm.proxy import _types
+
+    existing_key, table = router_weight_key_scope
+    table.find_many.return_value[0].model_info = {}
+    request = getattr(_types, request_name)(
+        key=existing_key.token, team_id=target_team
+    )
+    result = await prepare_key_update_data(request, existing_key)
+    assert result["team_id"] == target_team
+    assert "router_settings" not in result
+    assert existing_key.router_settings == {
+        "weights": {"gpt-4": {"weighted-id": 1}}
+    }
+    table.find_many.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_name", ["UpdateKeyRequest", "RegenerateKeyRequest"])
+@pytest.mark.parametrize("team_update", [{}, {"team_id": "old-team"}], ids=["omitted", "unchanged"])
+async def test_key_update_preserves_legacy_weights_without_scope_change(
+    router_weight_key_scope, request_name, team_update
+):
+    from litellm.proxy import _types
+
+    existing_key, table = router_weight_key_scope
+    existing_key.router_settings = {"weights": {"gpt-4": {"old-id": "legacy"}}}
+    request = getattr(_types, request_name)(
+        key=existing_key.token, key_alias="renamed", **team_update
+    )
+    result = await prepare_key_update_data(request, existing_key)
+    assert result["key_alias"] == "renamed"
+    assert "router_settings" not in result
+    assert existing_key.router_settings == {
+        "weights": {"gpt-4": {"old-id": "legacy"}}
+    }
+    table.find_many.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_name", ["UpdateKeyRequest", "RegenerateKeyRequest"])
+@pytest.mark.parametrize("target_team", ["new-team", None], ids=["move", "detach"])
+@pytest.mark.parametrize("clear_settings", [None, {}, {"weights": None}, {"weights": {}}])
+async def test_key_team_change_can_clear_retained_weights(
+    router_weight_key_scope, request_name, target_team, clear_settings
+):
+    from litellm.proxy import _types
+
+    existing_key, table = router_weight_key_scope
+    existing_key.router_settings = {"weights": {"gpt-4": {"old-id": "legacy"}}}
+    request = getattr(_types, request_name)(
+        key=existing_key.token,
+        team_id=target_team,
+        router_settings=clear_settings,
+    )
+    result = await prepare_key_update_data(request, existing_key)
+    assert result["team_id"] == target_team
+    actual_settings = result["router_settings"]
+    if actual_settings is not None:
+        actual_settings = json.loads(actual_settings)
+    assert actual_settings == clear_settings
+    table.find_many.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_name", ["UpdateKeyRequest", "RegenerateKeyRequest"])
+@pytest.mark.parametrize("target_team", ["new-team", None], ids=["move", "detach"])
+async def test_key_team_change_validates_replacement_weights_in_target_scope(
+    router_weight_key_scope, request_name, target_team
+):
+    from types import SimpleNamespace
+    from litellm.proxy import _types
+
+    existing_key, table = router_weight_key_scope
+    table.find_many.return_value = [SimpleNamespace(
+        model_id="replacement-id",
+        model_name="gpt-4",
+        model_info={"team_id": target_team},
+    )]
+    replacement = {"weights": {"gpt-4": {"replacement-id": 1}}}
+    request = getattr(_types, request_name)(
+        key=existing_key.token, team_id=target_team, router_settings=replacement
+    )
+    result = await prepare_key_update_data(request, existing_key)
+    assert result["team_id"] == target_team
+    assert json.loads(result["router_settings"]) == replacement
+    table.find_many.assert_awaited_once_with(
+        where={"model_id": {"in": ["replacement-id"]}}
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["update", "regenerate"])
+@pytest.mark.parametrize("target_team", ["new-team", None], ids=["move", "detach"])
+async def test_key_team_change_malformed_weights_return_public_400(
+    monkeypatch, router_weight_key_scope, endpoint, target_team
+):
+    from types import SimpleNamespace
+    from fastapi import Request
+    from litellm.proxy import _types
+    from litellm.proxy.management_endpoints import key_management_endpoints
+
+    existing_key, model_table = router_weight_key_scope
+    existing_key.router_settings = {"weights": {"gpt-4": {"weighted-id": "legacy-private-value"}}}
+    key_table = SimpleNamespace(
+        find_unique=AsyncMock(return_value=existing_key), update=AsyncMock()
+    )
+    db = SimpleNamespace(db=SimpleNamespace(
+        litellm_verificationtoken=key_table,
+        litellm_proxymodeltable=model_table,
+    ))
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", db)
+    monkeypatch.setattr("litellm.proxy.proxy_server.premium_user", True)
+    monkeypatch.setattr("litellm.proxy.proxy_server.master_key", None)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_custom_key_update", None)
+    monkeypatch.setattr(key_management_endpoints, "_validate_update_key_data", AsyncMock())
+    monkeypatch.setattr(key_management_endpoints, "_persist_deleted_verification_tokens", AsyncMock())
+    request_type = _types.UpdateKeyRequest if endpoint == "update" else _types.RegenerateKeyRequest
+    data = request_type(key=existing_key.token, team_id=target_team)
+    caller = UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin")
+
+    call = (
+        key_management_endpoints.update_key_fn(
+            request=Request({"type": "http", "method": "POST", "path": "/key/update"}),
+            data=data, user_api_key_dict=caller, litellm_changed_by=None,
+        )
+        if endpoint == "update"
+        else key_management_endpoints.regenerate_key_fn(
+            data=data, user_api_key_dict=caller, litellm_changed_by=None
+        )
+    )
+    with pytest.raises(ProxyException) as exc:
+        await call
+    assert str(exc.value.code) == "400"
+    assert exc.value.message == "Invalid router weights. Replace or clear router_settings.weights."
+    key_table.update.assert_not_awaited()
+    model_table.find_many.assert_not_awaited()
 
 
 @pytest.mark.asyncio

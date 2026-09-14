@@ -92,6 +92,7 @@ from litellm.proxy.management_endpoints.common_utils import (
     _user_has_admin_view,
     validate_budget_duration,
     validate_finite_spend,
+    validate_router_settings_weights,
 )
 from litellm.proxy.management_endpoints.model_management_endpoints import (
     _add_model_to_db,
@@ -152,7 +153,7 @@ from litellm.types.proxy.management_endpoints.key_management_endpoints import (
     KeySearchWhere,
     SuccessfulKeyUpdate,
 )
-from litellm.types.router import Deployment
+from litellm.types.router import Deployment, UpdateRouterConfig
 from litellm.types.utils import (
     BudgetConfig,
     PersonalUIKeyGenerationConfig,
@@ -199,6 +200,10 @@ class _ModelRowWhere(TypedDict):
 class _KeyUpdateResult(TypedDict):
     token: ReadOnly[str]
     data: ReadOnly[Mapping[str, object]]
+
+
+class _StoredKeyRouterSettings(BaseModel):
+    router_settings: Mapping[str, object] | None = None
 
 
 class _KeyRowWhere(TypedDict):
@@ -2235,6 +2240,24 @@ async def prepare_key_update_data(
     data: UpdateKeyRequest | RegenerateKeyRequest,
     existing_key_row: LiteLLM_VerificationToken,
 ):
+    from litellm.proxy.proxy_server import llm_router, prisma_client
+
+    if data.router_settings is not None or (
+        "router_settings" not in data.model_fields_set
+        and "team_id" in data.model_fields_set
+        and data.team_id != existing_key_row.team_id
+    ):
+        effective_settings: Final[UpdateRouterConfig | Mapping[str, object] | None] = (
+            data.router_settings
+            if data.router_settings is not None
+            else _StoredKeyRouterSettings.model_validate(existing_key_row, from_attributes=True).router_settings
+        )
+        await validate_router_settings_weights(
+            effective_settings,
+            team_id=data.team_id if "team_id" in data.model_fields_set else existing_key_row.team_id,
+            prisma_client=prisma_client,
+            llm_router=llm_router,
+        )
     data_json: Final[dict] = data.model_dump(exclude_unset=True)
     data_json.pop("key", None)
     data_json.pop("new_key", None)
@@ -4137,14 +4160,21 @@ async def generate_key_helper_fn(
     object_permission: LiteLLM_ObjectPermissionBase | None = None,
     auto_rotate: bool | None = None,
     rotation_interval: str | None = None,
-    router_settings: dict | None = None,
+    router_settings: dict[str, object] | None = None,
     access_group_ids: list[str] | None = None,
     budget_limits: list | None = None,  # multiple concurrent budget windows
 ):
-    from litellm.proxy.proxy_server import premium_user, prisma_client
+    from litellm.proxy.proxy_server import llm_router, premium_user, prisma_client
 
     if prisma_client is None:
         raise Exception("Connect Proxy to database to generate keys - https://docs.litellm.ai/docs/proxy/virtual_keys ")
+
+    await validate_router_settings_weights(
+        router_settings,
+        team_id=team_id,
+        prisma_client=prisma_client,
+        llm_router=llm_router,
+    )
 
     if token is None:
         if key is not None:

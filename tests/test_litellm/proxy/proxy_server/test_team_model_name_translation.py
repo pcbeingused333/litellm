@@ -159,6 +159,88 @@ async def test_model_info_v2_translates_team_model_name(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("selected_id", ["byok-first", "byok-second"])
+async def test_model_info_v2_public_group_routes_team_provider_weights(
+    monkeypatch, mock_prisma, selected_id
+):
+    from litellm import Router
+    from litellm.proxy._types import LiteLLM_TeamTable
+
+    team_id = "team-abc-123"
+    public_name = "team-provider-pool"
+    deployments = [
+        {
+            "model_name": f"model_name_{team_id}_{deployment_id}",
+            "litellm_params": {
+                "model": "gpt-4o",
+                "api_key": "sk-test",
+                "weight": global_weight,
+            },
+            "model_info": {
+                "id": deployment_id,
+                "team_id": team_id,
+                "team_public_model_name": public_name,
+                "db_model": True,
+            },
+        }
+        for deployment_id, global_weight in [("byok-first", 100), ("byok-second", 0)]
+    ]
+    router = Router(model_list=deployments, num_retries=0)
+    team = LiteLLM_TeamTable(team_id=team_id, models=[public_name])
+    mock_prisma.db.litellm_teamtable.find_many.return_value = [team]
+    mock_prisma.db.litellm_teamtable.find_unique.return_value = team
+    config = MagicMock()
+    config.get_config = AsyncMock(return_value={})
+    monkeypatch.setattr(ps, "llm_router", router)
+    monkeypatch.setattr(ps, "prisma_client", mock_prisma)
+    monkeypatch.setattr(ps, "proxy_config", config)
+    monkeypatch.setattr(ps, "user_model", None)
+
+    response = await ps.model_info_v2(
+        user_api_key_dict=UserAPIKeyAuth(
+            user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN
+        ),
+        model=None,
+        user_models_only=False,
+        include_team_models=True,
+        debug=False,
+        page=1,
+        size=1000,
+        search=None,
+        modelId=None,
+        teamId=team_id,
+        sortBy=None,
+        sortOrder="asc",
+        exclude_auto_routers=False,
+        access_group=None,
+        wildcard_only=False,
+    )
+
+    assert response["total_count"] == 2
+    assert {row["model_name"] for row in response["data"]} == {public_name}
+    assert {row["model_info"]["id"] for row in response["data"]} == {
+        "byok-first", "byok-second"
+    }
+    listed_name = response["data"][0]["model_name"]
+    weights = {
+        row["model_info"]["id"]: 100 if row["model_info"]["id"] == selected_id else 0
+        for row in response["data"]
+    }
+    selected = await router.async_get_available_deployment(
+        model=listed_name,
+        request_kwargs={
+            "metadata": {"user_api_key_team_id": team_id},
+            "_router_weights": {listed_name: weights},
+        },
+    )
+
+    assert selected["model_info"]["id"] == selected_id
+    assert {row["model_name"] for row in router.model_list} == {
+        row["model_name"] for row in deployments
+    }
+
+
+@pytest.mark.asyncio
 async def test_model_info_v2_exact_model_filter_matches_team_public_name(monkeypatch):
     """`/v2/model/info?model=<public name>` must keep the team-scoped row whose
     `model_name` is the internal routing key: the dashboard links team model
