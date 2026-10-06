@@ -1171,3 +1171,48 @@ async def test_plain_text_stream_announces_exactly_one_message_item(sync_mode: b
             ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE,
         ):
             assert event.item_id == message_item_adds[0].item.id
+
+
+def _signed_thinking_chunks(thinking: str, signature: str) -> tuple[ModelResponseStream, ...]:
+    """Thinking text and its signature in separate deltas, the way Bedrock and Anthropic stream them"""
+    return tuple(
+        ModelResponseStream(
+            id=CHAT_COMPLETION_ID,
+            created=1748575031,
+            model="claude-haiku-4-5",
+            object="chat.completion.chunk",
+            choices=[StreamingChoices(index=0, delta=delta)],
+        )
+        for delta in (
+            Delta(
+                role="assistant",
+                reasoning_content=thinking,
+                thinking_blocks=[{"type": "thinking", "thinking": thinking}],
+            ),
+            Delta(role="assistant", thinking_blocks=[{"type": "thinking", "thinking": "", "signature": signature}]),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_reasoning_output_item_done_carries_the_encrypted_content_of_response_completed():
+    iterator: Final = _build_iterator(
+        [*_signed_thinking_chunks("let me think", "sig_1"), _tool_call_chunk(), _chunk("", finish_reason="tool_calls")]
+    )
+
+    events: Final = await _collect_events(iterator, sync_mode=False)
+
+    reasoning_done_items: Final = [
+        event.item
+        for event in events
+        if getattr(event, "type", None) == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE and event.item.type == "reasoning"
+    ]
+    completed: Final = next(
+        event for event in events if getattr(event, "type", None) == ResponsesAPIStreamEvents.RESPONSE_COMPLETED
+    )
+    completed_reasoning: Final = next(item for item in completed.response.output if item.type == "reasoning")
+    assert len(reasoning_done_items) == 1
+    assert json.loads(getattr(reasoning_done_items[0], "encrypted_content", None) or "null") == [
+        {"type": "thinking", "thinking": "let me think", "signature": "sig_1"}
+    ], "clients that replay output_item.done send back unsigned thinking, and the next tool turn drops thinking"
+    assert reasoning_done_items[0].encrypted_content == completed_reasoning.encrypted_content

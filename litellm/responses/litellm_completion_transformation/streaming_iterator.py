@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from typing import Any, Final, cast
 
 import litellm
+from litellm.litellm_core_utils.streaming_chunk_builder_utils import ChunkProcessor
 from litellm.main import stream_chunk_builder
 from litellm.responses.litellm_completion_transformation.custom_tools import (
     build_tool_call_item_kwargs,
@@ -11,7 +12,10 @@ from litellm.responses.litellm_completion_transformation.custom_tools import (
     is_custom_tool_call,
     serialize_tool_call_arguments,
 )
-from litellm.responses.litellm_completion_transformation.reasoning_items import mint_reasoning_item_id
+from litellm.responses.litellm_completion_transformation.reasoning_items import (
+    encode_thinking_blocks,
+    mint_reasoning_item_id,
+)
 from litellm.responses.litellm_completion_transformation.transformation import (
     LiteLLMCompletionResponsesConfig,
 )
@@ -812,11 +816,19 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             ),
         )
 
+    def _encrypted_reasoning_content(self) -> str | None:
+        processor: Final = ChunkProcessor(self.collected_chat_completion_chunks)
+        combined: Final = processor.get_combined_thinking_content(
+            processor.chunks  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # ChunkProcessor.chunks is an untyped list
+        )
+        return encode_thinking_blocks(combined or ())
+
     def create_reasoning_output_item_done_event(
         self,
         reasoning_item_id: str,
         reasoning_content: str,
         sequence_number: int,
+        encrypted_content: str | None = None,
     ) -> OutputItemDoneEvent:
         """
         Create response.output_item.done event for reasoning items.
@@ -852,6 +864,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                             "text": reasoning_content,
                         }
                     ],
+                    **({"encrypted_content": encrypted_content} if encrypted_content else {}),
                 }
             ),
         )
@@ -1056,6 +1069,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                                     reasoning_item_id=reasoning_item_id,
                                     reasoning_content=reasoning_content,
                                     sequence_number=self._sequence_number,
+                                    encrypted_content=self._encrypted_reasoning_content(),
                                 )
                                 self._pending_response_events.extend(
                                     [
