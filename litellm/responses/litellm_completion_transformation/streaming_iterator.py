@@ -40,6 +40,7 @@ from litellm.types.llms.openai import (
     ResponseIncompleteEvent,
     ResponseInProgressEvent,
     ResponseInputParam,
+    ResponsePartAddedEvent,
     ResponsesAPIOptionalRequestParams,
     ResponsesAPIResponse,
     ResponsesAPIStreamEvents,
@@ -998,12 +999,24 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                         "id": self._cached_reasoning_item_id,
                         "type": "reasoning",
                         "status": "in_progress",
-                        "summary": None,
+                        "summary": [],
                     }
                 ),
             )
             event.__dict__["sequence_number"] = self._sequence_number
             self._pending_response_events.append(event)
+            # The summary part opens before its first summary_text delta, as in OpenAI's stream.
+            self._sequence_number += 1
+            self._pending_response_events.append(
+                ResponsePartAddedEvent(
+                    type=ResponsesAPIStreamEvents.RESPONSE_PART_ADDED,
+                    item_id=self._cached_reasoning_item_id,
+                    output_index=self._reasoning_index(),
+                    sequence_number=self._sequence_number,
+                    summary_index=0,
+                    part={"type": "summary_text", "text": ""},
+                )
+            )
             return
 
         # Tool-first

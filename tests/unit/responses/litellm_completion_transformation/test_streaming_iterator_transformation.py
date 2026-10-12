@@ -1136,6 +1136,36 @@ async def test_signature_only_thinking_streams_a_replayable_reasoning_item(sync_
 
 @pytest.mark.parametrize("sync_mode", [True, False])
 @pytest.mark.asyncio
+async def test_reasoning_item_opens_its_summary_part_before_the_first_summary_delta(sync_mode: bool):
+    iterator: Final = _build_iterator(
+        [_reasoning_chunk("let me "), _reasoning_chunk("think"), _chunk("Hi", finish_reason="stop")]
+    )
+
+    events: Final = await _collect_events(iterator, sync_mode)
+
+    added: Final = next(
+        event
+        for event in events
+        if getattr(event, "type", None) == ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED and event.item.type == "reasoning"
+    )
+    reasoning_events: Final = [
+        event for event in events if getattr(event, "item_id", None) == added.item.id or event is added
+    ]
+    assert [event.type for event in reasoning_events[:3]] == [
+        ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
+        ResponsesAPIStreamEvents.RESPONSE_PART_ADDED,
+        ResponsesAPIStreamEvents.REASONING_SUMMARY_TEXT_DELTA,
+    ]
+    assert added.item.summary == []
+    part_added: Final = reasoning_events[1]
+    assert part_added.output_index == added.output_index
+    assert part_added.summary_index == 0
+    assert dict(part_added.part) == {"type": "summary_text", "text": ""}
+    assert part_added.sequence_number > added.sequence_number
+
+
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.asyncio
 async def test_reasoning_then_text_announces_message_item_before_text_events(sync_mode: bool):
     iterator: Final = _build_iterator(
         [
