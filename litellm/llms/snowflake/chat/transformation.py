@@ -29,7 +29,12 @@ from litellm.litellm_core_utils.url_utils import join_api_base
 from litellm.llms.anthropic.chat.handler import ModelResponseIterator as AnthropicStreamParser
 from litellm.llms.anthropic.chat.transformation import AnthropicConfig
 from litellm.llms.anthropic.common_utils import normalize_cache_control_in_anthropic_payload
-from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolCallChunk, ChatCompletionToolMessage
+from litellm.types.llms.openai import (
+    AllMessageValues,
+    ChatCompletionToolCallChunk,
+    ChatCompletionToolMessage,
+    ChatCompletionUsageBlock,
+)
 from litellm.types.utils import (
     Choices,
     GenericStreamingChunk,
@@ -674,14 +679,33 @@ class SnowflakeStreamingHandler(BaseModelResponseIterator):
             return self._parse_openai_chunk(chunk)
         return self._anthropic_parser.chunk_parser(chunk)
 
+    @staticmethod
+    def _openai_usage_block(chunk: object) -> ChatCompletionUsageBlock | None:
+        # Cortex sends usage on the last chunk when stream_options.include_usage is set
+        fields: Final = as_str_mapping(chunk)
+        usage: Final = as_str_mapping(fields.get("usage")) if fields is not None else None
+        if usage is None:
+            return None
+
+        def _count(key: str) -> int:
+            value: Final = usage.get(key)
+            return int(value) if isinstance(value, (int, float)) else 0
+
+        return ChatCompletionUsageBlock(
+            prompt_tokens=_count("prompt_tokens"),
+            completion_tokens=_count("completion_tokens"),
+            total_tokens=_count("total_tokens"),
+        )
+
     def _parse_openai_chunk(self, chunk: dict) -> GenericStreamingChunk:
         choices: Final = chunk.get("choices", [])
+        usage: Final = self._openai_usage_block(chunk)  # pyright: ignore[reportUnknownArgumentType]  # untyped SSE chunk dict
         if not choices:
             return GenericStreamingChunk(
                 text="",
                 is_finished=False,
                 finish_reason="",
-                usage=None,
+                usage=usage,
                 index=0,
                 tool_use=None,
             )
@@ -710,7 +734,7 @@ class SnowflakeStreamingHandler(BaseModelResponseIterator):
             text=text,
             is_finished=finish_reason != "",
             finish_reason=finish_reason,
-            usage=None,
+            usage=usage,
             index=choice.get("index", 0),
             tool_use=tool_use,
         )

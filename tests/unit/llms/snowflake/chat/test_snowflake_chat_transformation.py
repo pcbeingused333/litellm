@@ -537,6 +537,39 @@ class TestSnowflakeCortexClaudeFixes:
         assert "$schema" not in schema
         assert "$schema" in schema["properties"]
 
+    def test_openai_dialect_stream_reports_usage_from_the_final_chunk(self):
+        handler = SnowflakeStreamingHandler(streaming_response=[], sync_stream=True)
+        usage_chunk = handler.chunk_parser(
+            {
+                "id": "chatcmpl-snowflake-stream-123",
+                "object": "chat.completion.chunk",
+                "choices": [],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+            }
+        )
+        finish_chunk = handler.chunk_parser(
+            {
+                "id": "chatcmpl-snowflake-stream-123",
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+            }
+        )
+
+        for chunk in (usage_chunk, finish_chunk):
+            assert chunk["usage"] is not None
+            assert chunk["usage"]["prompt_tokens"] == 11
+            assert chunk["usage"]["completion_tokens"] == 7
+            assert chunk["usage"]["total_tokens"] == 18
+
+    def test_openai_dialect_stream_without_usage_reports_none(self):
+        handler = SnowflakeStreamingHandler(streaming_response=[], sync_stream=True)
+        chunk = handler.chunk_parser(
+            {"id": "x", "choices": [{"index": 0, "delta": {"content": "Hi"}, "finish_reason": None}]}
+        )
+
+        assert chunk["usage"] is None
+
     def test_streaming_tool_identity_is_emitted_only_on_start(self):
         handler = SnowflakeStreamingHandler(streaming_response=[], sync_stream=True)
         start = handler.chunk_parser(
